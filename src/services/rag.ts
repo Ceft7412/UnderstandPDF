@@ -1,7 +1,7 @@
 "use server";
 
 import { createClient } from "@/lib/supabase/server";
-import { PDFParse } from "pdf-parse";
+import PDFJS from "pdf2json";
 import { updateDocumentStatus } from "./documents";
 
 // ---------- Config ----------
@@ -46,28 +46,43 @@ function estimateTokens(text: string): number {
 }
 
 /**
- * Extract text from a PDF buffer using pdf-parse v2's class-based API.
+ * Extract text from a PDF buffer using pdf2json (pure Node.js, SSR-compatible).
  * Returns per-page text and total page count.
  */
 async function extractTextFromPdf(
-  buffer: Buffer
+  buffer: Buffer,
 ): Promise<{ pages: PageText[]; totalPages: number }> {
-  const parser = new PDFParse({ data: new Uint8Array(buffer) });
+  return new Promise((resolve, reject) => {
+    const pdfParser = new PDFJS();
 
-  try {
-    const textResult = await parser.getText({
-      pageJoiner: "", // we handle page joining ourselves
+    pdfParser.on("pdfParser_dataError", (errData: Error | { parserError: Error }) => {
+      const err = errData instanceof Error ? errData : errData.parserError;
+      reject(new Error(`Failed to parse PDF: ${err.message}`));
     });
 
-    const pages: PageText[] = textResult.pages.map((p) => ({
-      page: p.num,
-      text: p.text,
-    }));
+    pdfParser.on("pdfParser_dataReady", (pdfData: { Pages: Array<{ Texts: Array<{ R: Array<{ T: string }> }> }> }) => {
+      try {
+        const pageTexts: PageText[] = pdfData.Pages.map((page, index) => {
+          const text = page.Texts.map((textItem) =>
+            decodeURIComponent(textItem.R.map((r) => r.T).join(""))
+          ).join(" ");
+          return {
+            page: index + 1, // 1-indexed
+            text: text,
+          };
+        });
 
-    return { pages, totalPages: textResult.total };
-  } finally {
-    await parser.destroy();
-  }
+        resolve({
+          pages: pageTexts,
+          totalPages: pageTexts.length,
+        });
+      } catch (err) {
+        reject(new Error(`Failed to extract text: ${err}`));
+      }
+    });
+
+    pdfParser.parseBuffer(buffer);
+  });
 }
 
 /**
@@ -102,7 +117,10 @@ function chunkText(pages: PageText[]): TextChunk[] {
     const sentenceTokens = estimateTokens(sentence.text);
 
     // If adding this sentence would exceed the chunk size, finalize the current chunk
-    if (currentTokens + sentenceTokens > CHUNK_SIZE && currentChunk.length > 0) {
+    if (
+      currentTokens + sentenceTokens > CHUNK_SIZE &&
+      currentChunk.length > 0
+    ) {
       const content = currentChunk.join(" ");
       chunks.push({
         content,
@@ -153,7 +171,7 @@ function chunkText(pages: PageText[]): TextChunk[] {
  */
 async function generateEmbeddings(
   texts: string[],
-  taskType: "RETRIEVAL_DOCUMENT" | "RETRIEVAL_QUERY" = "RETRIEVAL_DOCUMENT"
+  taskType: "RETRIEVAL_DOCUMENT" | "RETRIEVAL_QUERY" = "RETRIEVAL_DOCUMENT",
 ): Promise<number[][]> {
   const apiKey = getGeminiApiKey();
   const allEmbeddings: number[][] = [];
@@ -175,13 +193,13 @@ async function generateEmbeddings(
             outputDimensionality: EMBEDDING_DIMS,
           })),
         }),
-      }
+      },
     );
 
     if (!response.ok) {
       const errorBody = await response.text();
       throw new Error(
-        `Gemini embedding API error (${response.status}): ${errorBody}`
+        `Gemini embedding API error (${response.status}): ${errorBody}`,
       );
     }
 
@@ -207,7 +225,7 @@ async function generateEmbeddings(
  * @returns true on success, error string on failure
  */
 export async function processDocument(
-  documentId: string
+  documentId: string,
 ): Promise<{ success: true } | { success: false; error: string }> {
   console.log("[processDocument] Starting for document:", documentId);
   const supabase = await createClient();
@@ -225,7 +243,12 @@ export async function processDocument(
       console.error("[processDocument] Document not found:", docError?.message);
       return { success: false, error: "Document not found." };
     }
-    console.log("[processDocument] Document found:", doc.file_name, "file_url:", doc.file_url);
+    console.log(
+      "[processDocument] Document found:",
+      doc.file_name,
+      "file_url:",
+      doc.file_url,
+    );
 
     // 2. Download the PDF from Supabase Storage
     console.log("[processDocument] Downloading PDF from storage...");
@@ -234,7 +257,10 @@ export async function processDocument(
       .download(doc.file_url);
 
     if (downloadError || !fileData) {
-      console.error("[processDocument] Download failed:", downloadError?.message);
+      console.error(
+        "[processDocument] Download failed:",
+        downloadError?.message,
+      );
       await updateDocumentStatus(documentId, "failed");
       return {
         success: false,
@@ -247,12 +273,20 @@ export async function processDocument(
     console.log("[processDocument] Extracting text...");
     const buffer = Buffer.from(await fileData.arrayBuffer());
     const { pages, totalPages } = await extractTextFromPdf(buffer);
-    console.log("[processDocument] Extracted", pages.length, "pages, total:", totalPages);
+    console.log(
+      "[processDocument] Extracted",
+      pages.length,
+      "pages, total:",
+      totalPages,
+    );
 
     if (pages.length === 0) {
       console.error("[processDocument] No text extracted");
       await updateDocumentStatus(documentId, "failed");
-      return { success: false, error: "Could not extract any text from the PDF." };
+      return {
+        success: false,
+        error: "Could not extract any text from the PDF.",
+      };
     }
 
     // Update total_pages on the document
@@ -271,7 +305,11 @@ export async function processDocument(
     }
 
     // 5. Generate embeddings
-    console.log("[processDocument] Generating embeddings for", chunks.length, "chunks...");
+    console.log(
+      "[processDocument] Generating embeddings for",
+      chunks.length,
+      "chunks...",
+    );
     const embeddings = await generateEmbeddings(chunks.map((c) => c.content));
     console.log("[processDocument] Embeddings generated:", embeddings.length);
 
@@ -291,13 +329,21 @@ export async function processDocument(
     const BATCH_SIZE = 50;
     for (let i = 0; i < rows.length; i += BATCH_SIZE) {
       const batch = rows.slice(i, i + BATCH_SIZE);
-      console.log("[processDocument] Inserting batch", Math.floor(i / BATCH_SIZE) + 1, "of", Math.ceil(rows.length / BATCH_SIZE));
+      console.log(
+        "[processDocument] Inserting batch",
+        Math.floor(i / BATCH_SIZE) + 1,
+        "of",
+        Math.ceil(rows.length / BATCH_SIZE),
+      );
       const { error: insertError } = await supabase
         .from("document_chunks")
         .insert(batch);
 
       if (insertError) {
-        console.error("[processDocument] Chunk insert failed:", insertError.message);
+        console.error(
+          "[processDocument] Chunk insert failed:",
+          insertError.message,
+        );
         await updateDocumentStatus(documentId, "failed");
         return {
           success: false,
@@ -329,7 +375,7 @@ export async function searchChunks(
   documentId: string,
   query: string,
   matchCount: number = 8,
-  matchThreshold: number = 0.3
+  matchThreshold: number = 0.3,
 ): Promise<
   Array<{
     id: string;
