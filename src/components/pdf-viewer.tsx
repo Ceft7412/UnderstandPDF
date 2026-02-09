@@ -1,20 +1,22 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Document, Page, pdfjs } from "react-pdf";
+import { Document, Page } from "react-pdf";
 import "react-pdf/dist/Page/TextLayer.css";
 import "react-pdf/dist/Page/AnnotationLayer.css";
 
-// Configure the PDF.js worker via CDN (matches the bundled pdfjs-dist version)
-pdfjs.GlobalWorkerOptions.workerSrc = `//unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
-
 // ---------- Types ----------
-
 export type ScrollMode = "single" | "continuous";
 
 export interface PdfViewerProps {
   /** PDF source — URL string, Blob/File, ArrayBuffer, or {url}/{data} object */
-  file: string | Blob | ArrayBuffer | { url: string } | { data: Uint8Array } | null;
+  file:
+    | string
+    | Blob
+    | ArrayBuffer
+    | { url: string }
+    | { data: Uint8Array }
+    | null;
   /** Currently displayed page (1-indexed). In continuous mode used for scrollTo. */
   pageNumber: number;
   /** Zoom / scale factor applied to the PDF's intrinsic size (default 1.0) */
@@ -39,8 +41,39 @@ export interface PdfViewerProps {
   rotate?: number;
 }
 
-// ---------- Component ----------
+// ---------- Dynamic PDF.js Loader ----------
+const usePdfJs = () => {
+  const [pdfjsLib, setPdfjsLib] = useState<typeof import("react-pdf") | null>(
+    null,
+  );
+  const [pdfjsLoaded, setPdfjsLoaded] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
+  useEffect(() => {
+    const loadPdfJs = async () => {
+      try {
+        const pdfjs = await import("react-pdf");
+        setPdfjsLib(pdfjs);
+        setPdfjsLoaded(true);
+
+        // Configure the PDF.js worker via CDN (matches the bundled pdfjs-dist version)
+        const pdfjsDist = await import("pdfjs-dist");
+        pdfjsDist.GlobalWorkerOptions.workerSrc = `//unpkg.com/pdfjs-dist@${pdfjsDist.version}/build/pdf.worker.min.mjs`;
+      } catch (err) {
+        setError(
+          err instanceof Error ? err.message : "Failed to load PDF library",
+        );
+        console.error("Failed to load PDF.js:", err);
+      }
+    };
+
+    loadPdfJs();
+  }, []);
+
+  return { pdfjsLib, pdfjsLoaded, error };
+};
+
+// ---------- Component ----------
 export default function PdfViewer({
   file,
   pageNumber,
@@ -56,13 +89,16 @@ export default function PdfViewer({
   rotate = 0,
 }: PdfViewerProps) {
   const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
   const [numPages, setNumPages] = useState(0);
+  const [error, setError] = useState<string | null>(null);
 
-  // Refs for page elements (continuous mode) — keyed by page number
-  const pageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
-  // Track whether we're programmatically scrolling (to avoid observer feedback)
-  const isScrollingTo = useRef(false);
+  // Dynamic imports for PDF.js to avoid SSR issues
+  const { pdfjsLib, pdfjsLoaded, error: pdfLoadError } = usePdfJs();
+
+  // Handle PDF.js loading errors from dynamic import
+  // Handle PDF.js loading errors from dynamic import
+  const finalError = error || pdfLoadError;
+  const finalIsLoading = isLoading || !pdfjsLoaded;
 
   const handleLoadSuccess = useCallback(
     (pdf: { numPages: number }) => {
@@ -82,6 +118,11 @@ export default function PdfViewer({
     },
     [onLoadError],
   );
+
+  // Refs for page elements (continuous mode) — keyed by page number
+  const pageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+  // Track whether we're programmatically scrolling (to avoid observer feedback)
+  const isScrollingTo = useRef(false);
 
   // In continuous mode, scroll to the requested page when pageNumber changes
   useEffect(() => {
@@ -110,10 +151,7 @@ export default function PdfViewer({
         let bestRatio = 0;
 
         for (const entry of entries) {
-          if (
-            entry.isIntersecting &&
-            entry.intersectionRatio > bestRatio
-          ) {
+          if (entry.isIntersecting && entry.intersectionRatio > bestRatio) {
             const page = Number(entry.target.getAttribute("data-page"));
             if (page) {
               bestRatio = entry.intersectionRatio;
@@ -153,19 +191,51 @@ export default function PdfViewer({
   const pageLoading = (
     <div className="flex h-[600px] w-[450px] items-center justify-center bg-white">
       <div className="h-6 w-6 animate-spin rounded-full border-2 border-gray-300 border-t-blue-600" />
+      <p className="text-xs text-gray-400">Loading PDF...</p>
     </div>
   );
+
+  // Don't render until PDF.js is loaded
+  if (!pdfjsLib) {
+    return (
+      <div className={className ?? ""}>
+        {/* Error state */}
+        {finalError && !finalIsLoading && (
+          <div className="flex w-full items-center justify-center px-6 py-12">
+            <div className="rounded-lg border border-red-200 bg-red-50 px-6 py-4 text-center">
+              <p className="text-sm font-medium text-red-800">
+                Failed to load PDF
+              </p>
+              <p className="mt-1 text-xs text-red-600">{finalError}</p>
+            </div>
+          </div>
+        )}
+
+        {/* Loading state */}
+        {finalIsLoading && (
+          <div className="flex w-full items-center justify-center px-6 py-12">
+            <div className="rounded-lg border border-gray-200 bg-gray-50 px-6 py-4 text-center">
+              <div className="flex flex-col items-center gap-3">
+                <div className="h-6 w-6 animate-spin rounded-full border-2 border-gray-300 border-t-blue-600" />
+                <p className="text-xs text-gray-400">Loading PDF library...</p>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className={className ?? ""}>
       {/* Error state */}
-      {error && !isLoading && (
+      {finalError && !finalIsLoading && (
         <div className="flex w-full items-center justify-center px-6 py-12">
           <div className="rounded-lg border border-red-200 bg-red-50 px-6 py-4 text-center">
             <p className="text-sm font-medium text-red-800">
               Failed to load PDF
             </p>
-            <p className="mt-1 text-xs text-red-600">{error}</p>
+            <p className="mt-1 text-xs text-red-600">{finalError}</p>
           </div>
         </div>
       )}
@@ -174,14 +244,7 @@ export default function PdfViewer({
         file={file}
         onLoadSuccess={handleLoadSuccess}
         onLoadError={handleLoadError}
-        loading={
-          <div className="flex h-[600px] w-[450px] items-center justify-center">
-            <div className="flex flex-col items-center gap-3">
-              <div className="h-6 w-6 animate-spin rounded-full border-2 border-gray-300 border-t-blue-600" />
-              <p className="text-xs text-gray-400">Loading PDF...</p>
-            </div>
-          </div>
-        }
+        loading={finalIsLoading ? pageLoading : undefined}
       >
         {scrollMode === "single" ? (
           /* ---------- Single-page mode ---------- */
