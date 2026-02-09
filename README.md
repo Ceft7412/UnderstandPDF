@@ -1,4 +1,4 @@
-# ChatWithPDF
+# UnderstandPDF
 
 A web application that lets users upload PDF documents and instantly see AI-generated insights extracted from them. Instead of reading long documents, users can browse AI-generated cards summarizing key points with source citations while viewing the PDF side by side.
 
